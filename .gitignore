@@ -1,0 +1,8 @@
+# Source dictionary PDF (large binary, not redistributed)
+*.pdf
+
+# Uncompressed derived data (only the .gz is versioned)
+thesaurus/derived/*.jsonl
+
+# macOS
+.DS_Store
