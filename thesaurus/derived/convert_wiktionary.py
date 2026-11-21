@@ -35,7 +35,17 @@ Usage:
 Notes:
   - Strips etymology, pronunciation, usage examples, translations, inflections.
   - Caps definition length at 300 chars to keep artifact size manageable.
-  - Caps senses per word at 10 for the same reason.
+  - No cap on senses per word: an earlier cap of 10 cut "light", "run" and
+    "house" off before any sense that carried synonyms.
+  - The definition is the LAST gloss of a sense: Kaikki lists a subsense's
+    parent glosses first, so glosses[0] repeated the parent ("To move
+    swiftly." ten times for "run").
+  - Entry-level synonyms/antonyms (Kaikki puts some at the entry, not on a
+    sense) are attached to the sense whose gloss matches their "sense" hint,
+    else to the sense whose synonyms they overlap most, else the first sense.
+  - Senses with the same POS and definition are merged.
+  - Synonyms tagged obsolete/archaic/offensive/vulgar/derogatory are dropped;
+    senses with those tags are listed after the others.
   - Multi-word phrases (containing a space) are included — callers already
     pass a surface word, so multi-word entries simply won't match single words.
   - Words with no senses carrying any content (no def, no syn, no ant) are
@@ -45,12 +55,14 @@ Notes:
 
 import sys
 import json
+import re
 import gzip
 from collections import defaultdict
 from pathlib import Path
 
 MAX_DEF_LEN = 300
-MAX_SENSES = 10
+# Synonyms carrying one of these tags are dropped; senses carrying one sort last.
+BAD_TAGS = {"obsolete", "archaic", "offensive", "vulgar", "derogatory", "pejorative", "slur", "ethnic"}
 
 
 def extract_link_targets(items):
@@ -64,12 +76,54 @@ def extract_link_targets(items):
         if isinstance(item, str):
             word = item.strip()
         elif isinstance(item, dict):
+            if BAD_TAGS.intersection(item.get("tags") or []):
+                continue
             word = (item.get("word") or item.get("alt") or "").strip()
         else:
             continue
         if word:
             result.append(word)
     return result
+
+
+_TOKEN = re.compile(r"[a-z]+")
+
+
+def _tokens(text: str) -> set[str]:
+    return {t for t in _TOKEN.findall(text.lower()) if len(t) > 2}
+
+
+def _dedupe(words: list[str]) -> list[str]:
+    seen, out = set(), []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
+
+
+def attach_entry_level(senses: list[dict], rels: list, key: str, word: str) -> None:
+    """Route entry-level synonyms/antonyms onto the best-matching sense."""
+    if not senses:
+        return
+    for item in rels:
+        if not isinstance(item, dict):
+            continue
+        target = (item.get("word") or "").strip()
+        if not target or target.lower() == word.lower():
+            continue
+        hint = _tokens(item.get("sense") or "")
+        best, best_score = senses[0], 0
+        for s in senses:
+            if hint:
+                score = len(hint & _tokens(s.get("definition") or ""))
+            else:
+                score = len(_tokens(target) & {t for w in s.get("synonyms", []) for t in _tokens(w)})
+            if score > best_score:
+                best, best_score = s, score
+        best.setdefault(key, [])
+        if target not in best[key]:
+            best[key].append(target)
 
 
 def process_file(in_path: str, out_path: str) -> None:
@@ -109,9 +163,10 @@ def process_file(in_path: str, out_path: str) -> None:
 
             # Each Kaikki entry has a top-level 'senses' list.
             kaikki_senses = entry.get("senses") or []
+            entry_senses: list[dict] = []
             for ks in kaikki_senses:
                 glosses = ks.get("glosses") or []
-                raw_def = glosses[0].strip() if glosses else ""
+                raw_def = glosses[-1].strip() if glosses else ""
                 if len(raw_def) > MAX_DEF_LEN:
                     raw_def = raw_def[:MAX_DEF_LEN - 1] + "…"
                 definition = raw_def or None
@@ -124,10 +179,12 @@ def process_file(in_path: str, out_path: str) -> None:
                     continue
 
                 # De-duplicate against word itself
-                synonyms = [s for s in synonyms if s.lower() != word.lower()]
-                antonyms = [a for a in antonyms if a.lower() != word.lower()]
+                synonyms = _dedupe([s for s in synonyms if s.lower() != word.lower()])
+                antonyms = _dedupe([a for a in antonyms if a.lower() != word.lower()])
 
                 sense: dict = {}
+                if BAD_TAGS.intersection(ks.get("tags") or []):
+                    sense["_bad"] = True
                 if pos:
                     sense["pos"] = pos
                 if definition:
@@ -137,7 +194,22 @@ def process_file(in_path: str, out_path: str) -> None:
                 if antonyms:
                     sense["antonyms"] = antonyms
 
-                word_senses[word].append(sense)
+                entry_senses.append(sense)
+
+            attach_entry_level(entry_senses, entry.get("synonyms") or [], "synonyms", word)
+            attach_entry_level(entry_senses, entry.get("antonyms") or [], "antonyms", word)
+
+            # Merge senses with the same POS and definition.
+            existing = {(s.get("pos"), s.get("definition")): s for s in word_senses[word]}
+            for sense in entry_senses:
+                prev = existing.get((sense.get("pos"), sense.get("definition")))
+                if prev is None:
+                    word_senses[word].append(sense)
+                    existing[(sense.get("pos"), sense.get("definition"))] = sense
+                    continue
+                for k in ("synonyms", "antonyms"):
+                    if sense.get(k):
+                        prev[k] = _dedupe(prev.get(k, []) + sense[k])
 
             if lines_read % 100_000 == 0:
                 print(f"  {lines_read:,} lines read, {len(word_senses):,} words so far…",
@@ -147,7 +219,8 @@ def process_file(in_path: str, out_path: str) -> None:
 
     with open(out_path, "w", encoding="utf-8") as out:
         for word in sorted(word_senses):
-            senses = word_senses[word][:MAX_SENSES]
+            # Stable sort: archaic/obsolete/offensive senses go last.
+            senses = sorted(word_senses[word], key=lambda s: s.pop("_bad", False))
             obj = {"word": word, "senses": senses}
             out.write(json.dumps(obj, ensure_ascii=False) + "\n")
             words_written += 1
