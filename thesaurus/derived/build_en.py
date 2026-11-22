@@ -141,7 +141,7 @@ def read_moby(path):
 def acceptable(c, word, blocked, old, strict):
     if not c or c == word or c.lower() == word.lower():
         return False
-    if c in blocked or len(c.split()) > 3 or any(ch.isdigit() for ch in c):
+    if c in blocked or c.startswith("-") or c.endswith("-") or len(c.split()) > 3 or any(ch.isdigit() for ch in c):
         return False
     if word.islower() and not c.islower():
         return False
@@ -227,8 +227,9 @@ def build_word(word, wn_senses, synsets, wikt_senses, moby, moby_sets, neighbour
         strict = lambda c, s=s: s["score"][c] < 3  # synset members skip the rarity filter
         syns = [c for c in s["score"] if acceptable(c, word, blocked, old, strict(c))]
         syns.sort(key=lambda c: (-s["score"][c], len(c.split()) > 1, -zipf(c)))
+        shown = set(syns[:MAX_SYN])
         ants = list(dict.fromkeys(a for a in s["ants"]
-                                  if acceptable(a, word, blocked, old, True) and a not in s["score"]))
+                                  if acceptable(a, word, blocked, old, True) and a not in shown))
         sense = {"pos": s["pos"]}
         if s["definition"]:
             sense["definition"] = s["definition"]

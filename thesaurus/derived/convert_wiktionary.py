@@ -43,6 +43,10 @@ Notes:
   - Entry-level synonyms/antonyms (Kaikki puts some at the entry, not on a
     sense) are attached to the sense whose gloss matches their "sense" hint,
     else to the sense whose synonyms they overlap most, else the first sense.
+    Lists Kaikki copies from a Thesaurus page onto every entry of the word
+    are attached once per part of speech, not once per entry.
+  - MISFILED_ANTONYM_PAGES lists Thesaurus pages whose antonyms are known to
+    be misparsed; from those, only noun antonyms that name the word back are kept.
   - Senses with the same POS and definition are merged.
   - Synonyms tagged obsolete/archaic/offensive/vulgar/derogatory are dropped;
     senses with those tags are listed after the others.
@@ -61,6 +65,11 @@ from collections import defaultdict
 from pathlib import Path
 
 MAX_DEF_LEN = 300
+# Thesaurus pages whose antonym lists wiktextract gets wrong. Thesaurus:light
+# has a misspelled "Hypeoyms" heading after its noun "Antonyms", so its
+# hyponyms (alpha ray, gamma ray, microwave...) come out as antonyms of
+# "light". Drop this entry once the page is fixed upstream.
+MISFILED_ANTONYM_PAGES = {"Thesaurus:light"}
 # Synonyms carrying one of these tags are dropped; senses carrying one sort last.
 BAD_TAGS = {"obsolete", "archaic", "offensive", "vulgar", "derogatory", "pejorative", "slur", "ethnic"}
 
@@ -129,6 +138,7 @@ def attach_entry_level(senses: list[dict], rels: list, key: str, word: str) -> N
 def process_file(in_path: str, out_path: str) -> None:
     # word -> list of sense dicts in order of appearance
     word_senses: dict[str, list[dict]] = defaultdict(list)
+    entry_items: dict[tuple, dict] = defaultdict(dict)
 
     opener = gzip.open if in_path.endswith(".gz") else open
 
@@ -196,8 +206,13 @@ def process_file(in_path: str, out_path: str) -> None:
 
                 entry_senses.append(sense)
 
-            attach_entry_level(entry_senses, entry.get("synonyms") or [], "synonyms", word)
-            attach_entry_level(entry_senses, entry.get("antonyms") or [], "antonyms", word)
+            # Kaikki copies entry-level lists onto every entry of a word
+            # (light "bright" and light "not heavy" both get Thesaurus:light's),
+            # so they wait until all entries are read and are attached once
+            # per part of speech, to the best sense among all entries.
+            for key in ("synonyms", "antonyms"):
+                pend = entry_items[(word, pos)].setdefault(key, [])
+                pend += [i for i in entry.get(key) or [] if isinstance(i, dict) and i not in pend]
 
             # Merge senses with the same POS and definition.
             existing = {(s.get("pos"), s.get("definition")): s for s in word_senses[word]}
@@ -216,6 +231,24 @@ def process_file(in_path: str, out_path: str) -> None:
                       file=sys.stderr)
 
     print(f"Done reading: {lines_read:,} lines, {len(word_senses):,} words", file=sys.stderr)
+
+    pending_ants = defaultdict(set)
+    for (w, _), by_key in entry_items.items():
+        pending_ants[w].update(i.get("word", "") for i in by_key.get("antonyms", ()))
+
+    def antonyms_of(w):
+        return pending_ants.get(w, set()) | {a for s in word_senses.get(w, ()) for a in s.get("antonyms", ())}
+
+    for (word, pos), by_key in entry_items.items():
+        senses = [s for s in word_senses.get(word, []) if s.get("pos") == pos]
+        for key, items in by_key.items():
+            if key == "antonyms" and pos == "n":
+                # Keep only the noun antonyms such a page's own entries name back
+                # (darkness <-> light); the rest are its misfiled hyponyms.
+                items = [i for i in items
+                         if i.get("source") not in MISFILED_ANTONYM_PAGES
+                         or word in antonyms_of(i.get("word", ""))]
+            attach_entry_level(senses, items, key, word)
 
     with open(out_path, "w", encoding="utf-8") as out:
         for word in sorted(word_senses):
